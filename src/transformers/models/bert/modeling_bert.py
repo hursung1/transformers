@@ -27,6 +27,7 @@ import torch.utils.checkpoint
 from packaging import version
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torchcrf import CRF
 
 from ...activations import ACT2FN
 from ...file_utils import (
@@ -46,6 +47,7 @@ from ...modeling_outputs import (
     QuestionAnsweringModelOutput,
     SequenceClassifierOutput,
     TokenClassifierOutput,
+    SlotFillingModelOutput
 )
 from ...modeling_utils import (
     PreTrainedModel,
@@ -1881,23 +1883,43 @@ class BertForQuestionAnswering(BertPreTrainedModel):
         )
 
 
-class BertForSlu(BertPreTrainedModel):
-
+@add_start_docstrings(
+    """
+    Dual Bert Model with CRF Layer for cross-domain slot filling tasks
+    """,
+    BERT_START_DOCSTRING,
+)
+class BertForSLU(BertPreTrainedModel):
+    """
+    from BertForTokenClassification
+    """
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
 
-    def __init__(self, config):
+    def __init__(self, config, args):
         super().__init__(config)
         self.num_labels = config.num_labels
+        self.key_inputs = 3
+        self.num_tags = 3
+        self.momentum = args.momentum
+        self.key_updated_cnt = 0
+        self.key_update_period = args.key_update_period
 
         self.query_bert = BertModel(config, add_pooling_layer=False)
         self.key_bert = BertModel(config, add_pooling_layer=False)
+        
+        # freeze parameters of key encoder
+        for param in self.key_bert.parameters():
+            param.requires_grad = False
+
         classifier_dropout = (
             config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
         )
         self.dropout = nn.Dropout(classifier_dropout)
+        self.ce_loss = nn.CrossEntropyLoss()
 
-        # Linear + CRF
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels) 
+        # Linear + CRF (for BIO triplet tagging)
+        self.classifier = nn.Linear(config.hidden_size, self.num_tags) 
+        self.crf = CRF(self.num_tags)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1958,33 +1980,22 @@ class BertForSlu(BertPreTrainedModel):
         key_cls_output = key_outputs[1]
 
         # Contrastive loss
-        ## ****
+        # key input: [pos_tem, neg_tem1, neg_tem2] or [pos_aug, neg_aug1, neg_aug2]
+        label = torch.randperm(self.key_inputs)
+        key_cls_output = key_cls_output[label]
+        
+        cl_loss = self.ce_loss(torch.matmul(query_cls_output, key_cls_output), label)
 
+        # BIO Triplet tag(CRF) loss
         query_sequence_output = self.dropout(query_sequence_output)
         logits = self.classifier(query_sequence_output)
+        crf_loss = self.crf(logits, labels)
 
-        loss = None
-        if labels is not None:
-            loss_fct = CrossEntropyLoss()
-            # Only keep active parts of the loss
-            if attention_mask is not None:
-                active_loss = attention_mask.view(-1) == 1
-                active_logits = logits.view(-1, self.num_labels)
-                active_labels = torch.where(
-                    active_loss, labels.view(-1), torch.tensor(loss_fct.ignore_index).type_as(labels)
-                )
-                loss = loss_fct(active_logits, active_labels)
-            else:
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+        return crf_loss, cl_loss
 
-        if not return_dict:
-            output = (logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
+    def update_key_enc(self):
+        if self.key_updated_cnt % self.key_update_period == 0:
+            for q_params, k_params in zip(self.query_bert.parameters(), self.key_bert.parameters()):
+                k_params = self.m * k_params + (1 - self.m) * q_params
 
-        return TokenClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
+        return

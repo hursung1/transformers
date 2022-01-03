@@ -1377,7 +1377,7 @@ def add_code_sample_docstrings(
             code_sample = sample_docstrings["SequenceClassification"]
         elif "QuestionAnswering" in model_class:
             code_sample = sample_docstrings["QuestionAnswering"]
-        elif "TokenClassification" in model_class:
+        elif "TokenClassification" in model_class or "ForSLU" in model_class:
             code_sample = sample_docstrings["TokenClassification"]
         elif "MultipleChoice" in model_class:
             code_sample = sample_docstrings["MultipleChoice"]

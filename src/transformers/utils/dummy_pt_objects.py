@@ -842,6 +842,18 @@ class BertForTokenClassification:
         requires_backends(self, ["torch"])
 
 
+class BertForSLU:
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["torch"])
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        requires_backends(cls, ["torch"])
+
+    def forward(self, *args, **kwargs):
+        requires_backends(self, ["torch"])
+
+
 class BertLayer:
     def __init__(self, *args, **kwargs):
         requires_backends(self, ["torch"])

@@ -39,11 +39,13 @@ if is_torch_available():
         "BertForQuestionAnswering",
         "BertForSequenceClassification",
         "BertForTokenClassification",
+        "BertForSLU",
         "BertLayer",
         "BertLMHeadModel",
         "BertModel",
         "BertPreTrainedModel",
         "load_tf_weights_in_bert",
+        "BertForSLU",
     ]
 
 if is_tf_available():
@@ -93,6 +95,7 @@ if TYPE_CHECKING:
             BertForQuestionAnswering,
             BertForSequenceClassification,
             BertForTokenClassification,
+            BertForSLU,
             BertLayer,
             BertLMHeadModel,
             BertModel,
