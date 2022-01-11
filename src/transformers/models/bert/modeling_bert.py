@@ -1933,9 +1933,8 @@ class BertForSLU(BertPreTrainedModel):
     )
     def forward(
         self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
+        query_input, # utter(input_ids, attention_mask, token_type_ids)
+        key_input, # template, augmented_data(input_ids, attention_mask, token_type_ids)
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
@@ -1951,10 +1950,15 @@ class BertForSLU(BertPreTrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        q_input_ids = query_input["input_ids"]
+        q_attention_mask = query_input["attention_mask"]
+        q_token_type_ids = query_input["token_type_ids"]
+        q_labels = query_input["labels"]
+
         query_outputs = self.query_bert(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
+            q_input_ids,
+            attention_mask=q_attention_mask,
+            token_type_ids=q_token_type_ids,
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
@@ -1963,10 +1967,14 @@ class BertForSLU(BertPreTrainedModel):
             return_dict=return_dict,
         )
 
+        k_input_ids = key_input["input_ids"]
+        k_attention_mask = key_input["attention_mask"]
+        k_token_type_ids = key_input["token_type_ids"]
+
         key_outputs = self.key_bert(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
+            k_input_ids,
+            attention_mask=k_attention_mask,
+            token_type_ids=k_token_type_ids,
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
@@ -1989,9 +1997,9 @@ class BertForSLU(BertPreTrainedModel):
         # BIO Triplet tag(CRF) loss
         query_sequence_output = self.dropout(query_sequence_output)
         logits = self.classifier(query_sequence_output)
-        crf_loss = self.crf(logits, labels)
+        crf_loss = self.crf(logits, q_labels)
 
-        return crf_loss, cl_loss
+        return crf_loss, logits, cl_loss
 
     def update_key_enc(self):
         if self.key_updated_cnt % self.key_update_period == 0:

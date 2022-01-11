@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import random
+from re import template
 import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, NewType, Optional, Tuple, Union
@@ -389,6 +390,166 @@ class DataCollatorForTokenClassification(DataCollatorMixin):
 
         batch = {k: np.array(v, dtype=np.int64) for k, v in batch.items()}
         return batch
+
+
+@dataclass
+class DataCollatorForSLU(DataCollatorMixin):
+    """
+    Data collator that will dynamically pad the inputs received, as well as the labels.
+
+    Args:
+        tokenizer (:class:`~transformers.PreTrainedTokenizer` or :class:`~transformers.PreTrainedTokenizerFast`):
+            The tokenizer used for encoding the data.
+        padding (:obj:`bool`, :obj:`str` or :class:`~transformers.file_utils.PaddingStrategy`, `optional`, defaults to :obj:`True`):
+            Select a strategy to pad the returned sequences (according to the model's padding side and padding index)
+            among:
+
+            * :obj:`True` or :obj:`'longest'`: Pad to the longest sequence in the batch (or no padding if only a single
+              sequence if provided).
+            * :obj:`'max_length'`: Pad to a maximum length specified with the argument :obj:`max_length` or to the
+              maximum acceptable input length for the model if that argument is not provided.
+            * :obj:`False` or :obj:`'do_not_pad'` (default): No padding (i.e., can output a batch with sequences of
+              different lengths).
+        max_length (:obj:`int`, `optional`):
+            Maximum length of the returned list and optionally padding length (see above).
+        pad_to_multiple_of (:obj:`int`, `optional`):
+            If set will pad the sequence to a multiple of the provided value.
+
+            This is especially useful to enable the use of Tensor Cores on NVIDIA hardware with compute capability >=
+            7.5 (Volta).
+        label_pad_token_id (:obj:`int`, `optional`, defaults to -100):
+            The id to use when padding the labels (-100 will be automatically ignore by PyTorch loss functions).
+        return_tensors (:obj:`str`):
+            The type of Tensor to return. Allowable values are "np", "pt" and "tf".
+    """
+
+    tokenizer: PreTrainedTokenizerBase
+    padding: Union[bool, str, PaddingStrategy] = True
+    max_length: Optional[int] = None
+    pad_to_multiple_of: Optional[int] = None
+    label_pad_token_id: int = -100
+    return_tensors: str = "pt"
+
+    def torch_call(self, features):
+        import torch
+
+        utter_features = []
+        template_features = []
+        # pos_aug_data_features = []
+        # neg_aug_data_features = []
+        aug_data_features = []
+        for feature in features:
+            utter_features.append(feature['utter'])
+            template_features.extend(feature['template'])
+            aug_data_features.extend(feature['aug_data'])
+            # pos_aug_data_features.append(feature['pos_aug'])
+            # neg_aug_data_features.extend(feature['neg_aug'])
+
+        # features_list = [utter_features, template_features, pos_aug_data_features, neg_aug_data_features]
+        features_list = [utter_features, template_features, aug_data_features]
+        # batch_feature_name = ["utter", "template", "pos_aug", "neg_aug"]
+        batch_feature_name = ["utter", "template", "aug_data"]
+        batch = {}
+        
+        for key, _features in zip(batch_feature_name, features_list):
+            label_name = "label" if "label" in _features[0].keys() else "labels"
+            labels = [feature[label_name] for feature in _features] if label_name in _features[0].keys() else None
+            _batch = self.tokenizer.pad(
+                _features,
+                padding=self.padding,
+                max_length=self.max_length,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                # Conversion to tensors will fail if we have labels as they are not of the same length yet.
+                return_tensors="pt" if labels is None else None,
+            )
+
+            sequence_length = torch.tensor(_batch["input_ids"]).shape[1]
+            padding_side = self.tokenizer.padding_side
+            if key == "utter": # only utter has label
+                if padding_side == "right":
+                    _batch[label_name] = [
+                        list(label) + [self.label_pad_token_id] * (sequence_length - len(label)) for label in labels
+                    ]
+                else:
+                    _batch[label_name] = [
+                        [self.label_pad_token_id] * (sequence_length - len(label)) + list(label) for label in labels
+                    ]
+
+            else: # set label info for template and augmented data
+                _batch["labels"] = [1] # for positive one
+                _batch["labels"].extend([0 for _ in range(1, len(_batch["input_ids"]))]) # for negative one
+
+            _batch = {k: torch.tensor(v, dtype=torch.int64) for k, v in _batch.items()}
+            batch[key] = _batch
+
+        # 할거
+        # 특정 utter에 대한 template과 aug_data를 하나로 묶음
+        
+        
+        return batch
+
+    def tf_call(self, features):
+        import tensorflow as tf
+
+        label_name = "label" if "label" in features[0].keys() else "labels"
+        labels = [feature[label_name] for feature in features] if label_name in features[0].keys() else None
+        batch = self.tokenizer.pad(
+            features,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            # Conversion to tensors will fail if we have labels as they are not of the same length yet.
+            return_tensors="tf" if labels is None else None,
+        )
+
+        if labels is None:
+            return batch
+
+        sequence_length = tf.convert_to_tensor(batch["input_ids"]).shape[1]
+        padding_side = self.tokenizer.padding_side
+        if padding_side == "right":
+            batch["labels"] = [
+                list(label) + [self.label_pad_token_id] * (sequence_length - len(label)) for label in labels
+            ]
+        else:
+            batch["labels"] = [
+                [self.label_pad_token_id] * (sequence_length - len(label)) + list(label) for label in labels
+            ]
+
+        batch = {k: tf.convert_to_tensor(v, dtype=tf.int64) for k, v in batch.items()}
+        return batch
+
+    def numpy_call(self, features):
+        import numpy as np
+
+        label_name = "label" if "label" in features[0].keys() else "labels"
+        labels = [feature[label_name] for feature in features] if label_name in features[0].keys() else None
+        batch = self.tokenizer.pad(
+            features,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            # Conversion to tensors will fail if we have labels as they are not of the same length yet.
+            return_tensors="np" if labels is None else None,
+        )
+
+        if labels is None:
+            return batch
+
+        sequence_length = np.array(batch["input_ids"]).shape[1]
+        padding_side = self.tokenizer.padding_side
+        if padding_side == "right":
+            batch["labels"] = [
+                list(label) + [self.label_pad_token_id] * (sequence_length - len(label)) for label in labels
+            ]
+        else:
+            batch["labels"] = [
+                [self.label_pad_token_id] * (sequence_length - len(label)) + list(label) for label in labels
+            ]
+
+        batch = {k: np.array(v, dtype=np.int64) for k, v in batch.items()}
+        return batch
+
 
 
 def _torch_collate_batch(examples, tokenizer, pad_to_multiple_of: Optional[int] = None):
