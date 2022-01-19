@@ -19,6 +19,7 @@
 import math
 import os
 import warnings
+import random
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -1897,9 +1898,11 @@ class BertForSLU(BertPreTrainedModel):
 
     def __init__(self, config, args):
         super().__init__(config)
+
+        # hyperparams
         self.num_labels = config.num_labels
-        self.key_inputs = 3
         self.num_tags = 3
+        self.key_ratio = args.loss_key_ratio
         self.momentum = args.momentum
         self.key_updated_cnt = 0
         self.key_update_period = args.key_update_period
@@ -1919,7 +1922,7 @@ class BertForSLU(BertPreTrainedModel):
 
         # Linear + CRF (for BIO triplet tagging)
         self.classifier = nn.Linear(config.hidden_size, self.num_tags) 
-        self.crf = CRF(self.num_tags)
+        self.crf = CRF(self.num_tags, batch_first=True)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1934,7 +1937,8 @@ class BertForSLU(BertPreTrainedModel):
     def forward(
         self,
         query_input, # utter(input_ids, attention_mask, token_type_ids)
-        key_input, # template, augmented_data(input_ids, attention_mask, token_type_ids)
+        key_input, # template, augmented_data(input_ids, attention_mask, token_type_ids),
+        utter_ranges,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
@@ -1950,10 +1954,16 @@ class BertForSLU(BertPreTrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # update key encoder weight
+        with torch.no_grad():
+            self.update_key_enc()
+
         q_input_ids = query_input["input_ids"]
         q_attention_mask = query_input["attention_mask"]
         q_token_type_ids = query_input["token_type_ids"]
         q_labels = query_input["labels"]
+
+        query_batch_length = q_input_ids.shape[0]
 
         query_outputs = self.query_bert(
             q_input_ids,
@@ -1967,10 +1977,19 @@ class BertForSLU(BertPreTrainedModel):
             return_dict=return_dict,
         )
 
+        k_input_reshape = {}
+        key_batch_length, key_per_query, _ = key_input['input_ids'].shape
+
+        for k, v in key_input.items():
+            if len(v.shape) == 3:
+                k_input_reshape[k] = v.reshape(key_batch_length * key_per_query, -1)
+
         k_input_ids = key_input["input_ids"]
         k_attention_mask = key_input["attention_mask"]
         k_token_type_ids = key_input["token_type_ids"]
+        k_labels = key_input["labels"]
 
+        
         key_outputs = self.key_bert(
             k_input_ids,
             attention_mask=k_attention_mask,
@@ -1983,23 +2002,50 @@ class BertForSLU(BertPreTrainedModel):
             return_dict=return_dict,
         )
 
-        query_sequence_output = query_outputs[0]
-        query_cls_output = query_outputs[1]
-        key_cls_output = key_outputs[1]
+        query_sequence_output = query_outputs.last_hidden_state
+        query_cls_output = query_outputs.last_hidden_state[:, 0, :] # shape: (num_batch, bert_hidden_size)
+        key_cls_output = key_outputs.last_hidden_state[:, 0, :]
 
         # Contrastive loss
-        # key input: [pos_tem, neg_tem1, neg_tem2] or [pos_aug, neg_aug1, neg_aug2]
-        label = torch.randperm(self.key_inputs)
-        key_cls_output = key_cls_output[label]
+        # key input: [pos_tem/pos_aug, neg_tem1, neg_tem2, ..., neg_aug1, neg_aug2, ...]
+        # key_per_query = int(key_batch_length / query_batch_length)
+        # k_labels = torch.reshape(k_labels, (query_batch_length, key_per_query))
+        key_cls_output = torch.reshape(key_cls_output, (query_batch_length, key_per_query, key_cls_output.shape[1])) # shape: (num_batch, num_tem_aug_data, bert_hidden_size)
         
-        cl_loss = self.ce_loss(torch.matmul(query_cls_output, key_cls_output), label)
+        # modify key_cls_output for labeling
+        batch_label = []
+        for i in range(query_batch_length):
+        # for i, each_key_cls, k_label in enumerate(zip(key_cls_output, k_labels)):
+            label = torch.randperm(key_per_query)
+            key_cls_output[i] = key_cls_output[i][label]
+            batch_label.append((label == 0).nonzero().item())
+
+        query_cls_output.unsqueeze_(1)
+        key_cls_output = torch.transpose(key_cls_output, 1, 2) # shape: (num_batch, bert_hidden_size, num_adapting_data)
+
+        query_key_mult = torch.bmm(query_cls_output, key_cls_output).squeeze(1)
+        batch_label = torch.tensor(batch_label).cuda()
+        
+        cl_loss = self.ce_loss(query_key_mult, batch_label)
 
         # BIO Triplet tag(CRF) loss
         query_sequence_output = self.dropout(query_sequence_output)
         logits = self.classifier(query_sequence_output)
-        crf_loss = self.crf(logits, q_labels)
+        ## select only utterance: except padded seq & front seq([CLS]slot_label[SEP])
+        crf_losses = None
+        for logit, utter_range, q_label in zip(logits, utter_ranges, q_labels):
+            front, rear = utter_range
+            use_logit = logit[front:rear, :]
+            use_q_label = q_label[front:rear]
+            crf_loss = self.crf(use_logit.unsqueeze(0), use_q_label.unsqueeze(0))
+            try: 
+                crf_losses = torch.vstack(crf_losses, crf_loss)
+            except:
+                crf_losses = crf_loss
 
-        return crf_loss, logits, cl_loss
+        self.key_updated_cnt += 1
+        loss = crf_loss * (1-self.key_ratio) + cl_loss * self.key_ratio
+        return loss, logits
 
     def update_key_enc(self):
         if self.key_updated_cnt % self.key_update_period == 0:

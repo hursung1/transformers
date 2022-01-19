@@ -427,28 +427,30 @@ class DataCollatorForSLU(DataCollatorMixin):
     padding: Union[bool, str, PaddingStrategy] = True
     max_length: Optional[int] = None
     pad_to_multiple_of: Optional[int] = None
-    label_pad_token_id: int = -100
+    label_pad_token_id: int = 0
     return_tensors: str = "pt"
 
     def torch_call(self, features):
         import torch
+        import random
 
         utter_features = []
-        template_features = []
-        # pos_aug_data_features = []
-        # neg_aug_data_features = []
-        aug_data_features = []
+        utter_range = []
+        tem_aug_features = []
         for feature in features:
             utter_features.append(feature['utter'])
-            template_features.extend(feature['template'])
-            aug_data_features.extend(feature['aug_data'])
-            # pos_aug_data_features.append(feature['pos_aug'])
-            # neg_aug_data_features.extend(feature['neg_aug'])
+            utter_range.append(feature['utter_range'])
+            tem_aug_features.extend(feature['tem_aug_data'])
 
-        # features_list = [utter_features, template_features, pos_aug_data_features, neg_aug_data_features]
-        features_list = [utter_features, template_features, aug_data_features]
-        # batch_feature_name = ["utter", "template", "pos_aug", "neg_aug"]
-        batch_feature_name = ["utter", "template", "aug_data"]
+        # this is for tem_aug_features - labels
+        tem_per_utter = int(len(tem_aug_features) / len(utter_features))
+        batch_size = len(utter_features)
+        tem_aug_labels = [1]
+        for _ in range(1, tem_per_utter):
+            tem_aug_labels.append(0)
+
+        features_list = [utter_features, tem_aug_features]
+        batch_feature_name = ["utter", "tem_aug_data"]
         batch = {}
         
         for key, _features in zip(batch_feature_name, features_list):
@@ -465,27 +467,33 @@ class DataCollatorForSLU(DataCollatorMixin):
 
             sequence_length = torch.tensor(_batch["input_ids"]).shape[1]
             padding_side = self.tokenizer.padding_side
-            if key == "utter": # only utter has label
-                if padding_side == "right":
-                    _batch[label_name] = [
-                        list(label) + [self.label_pad_token_id] * (sequence_length - len(label)) for label in labels
-                    ]
-                else:
-                    _batch[label_name] = [
-                        [self.label_pad_token_id] * (sequence_length - len(label)) + list(label) for label in labels
-                    ]
+            if key == "utter": # utterance label
+                _batch[label_name] = [
+                    [self.label_pad_token_id] * front + 
+                    list(label) + 
+                    [self.label_pad_token_id] * (sequence_length - rear) 
+                    for label, (front, rear) in zip(labels, utter_range)
+                ] ####
+                # if padding_side == "right":
+                #     _batch[label_name] = [
+                #         list(label) + [self.label_pad_token_id] * (sequence_length - len(label)) for label in labels
+                #     ]
+                # else:
+                #     _batch[label_name] = [
+                #         [self.label_pad_token_id] * (sequence_length - len(label)) + list(label) for label in labels
+                #     ]
 
-            else: # set label info for template and augmented data
-                _batch["labels"] = [1] # for positive one
-                _batch["labels"].extend([0 for _ in range(1, len(_batch["input_ids"]))]) # for negative one
+            else: # template + augmented data: labeling and reshaping (batch_size, tem_per_utter, seq_len)
+                for _batch_key, _batch_val in _batch.items():
+                    _batch[_batch_key] = _batch_val.reshape(batch_size, tem_per_utter, -1)
+                _batch["labels"] = [tem_aug_labels for _ in range(batch_size)] 
+                # _batch["labels"] = [1] # for positive one
+                # _batch["labels"].extend([0 for _ in range(1, len(_batch["input_ids"]))]) # for negative one
 
             _batch = {k: torch.tensor(v, dtype=torch.int64) for k, v in _batch.items()}
             batch[key] = _batch
-
-        # 할거
-        # 특정 utter에 대한 template과 aug_data를 하나로 묶음
         
-        
+        batch['utter_range'] = torch.tensor(utter_range)
         return batch
 
     def tf_call(self, features):
