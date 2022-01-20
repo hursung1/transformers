@@ -1936,9 +1936,12 @@ class BertForSLU(BertPreTrainedModel):
     )
     def forward(
         self,
-        query_input, # utter(input_ids, attention_mask, token_type_ids)
-        key_input, # template, augmented_data(input_ids, attention_mask, token_type_ids),
+        q_input_ids, # utter(input_ids, attention_mask, token_type_ids)
+        q_token_type_ids,
+        q_attention_mask,
+        q_labels,
         utter_ranges,
+        key_input,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
@@ -1958,10 +1961,10 @@ class BertForSLU(BertPreTrainedModel):
         with torch.no_grad():
             self.update_key_enc()
 
-        q_input_ids = query_input["input_ids"]
-        q_attention_mask = query_input["attention_mask"]
-        q_token_type_ids = query_input["token_type_ids"]
-        q_labels = query_input["labels"]
+        # q_input_ids = query_input["input_ids"]
+        # q_attention_mask = query_input["attention_mask"]
+        # q_token_type_ids = query_input["token_type_ids"]
+        # q_labels = query_input["labels"]
 
         query_batch_length = q_input_ids.shape[0]
 
@@ -1977,79 +1980,82 @@ class BertForSLU(BertPreTrainedModel):
             return_dict=return_dict,
         )
 
-        k_input_reshape = {}
-        key_batch_length, key_per_query, _ = key_input['input_ids'].shape
-
-        for k, v in key_input.items():
-            if len(v.shape) == 3:
-                k_input_reshape[k] = v.reshape(key_batch_length * key_per_query, -1)
-
-        k_input_ids = key_input["input_ids"]
-        k_attention_mask = key_input["attention_mask"]
-        k_token_type_ids = key_input["token_type_ids"]
-        k_labels = key_input["labels"]
-
-        
-        key_outputs = self.key_bert(
-            k_input_ids,
-            attention_mask=k_attention_mask,
-            token_type_ids=k_token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
         query_sequence_output = query_outputs.last_hidden_state
         query_cls_output = query_outputs.last_hidden_state[:, 0, :] # shape: (num_batch, bert_hidden_size)
-        key_cls_output = key_outputs.last_hidden_state[:, 0, :]
-
-        # Contrastive loss
-        # key input: [pos_tem/pos_aug, neg_tem1, neg_tem2, ..., neg_aug1, neg_aug2, ...]
-        # key_per_query = int(key_batch_length / query_batch_length)
-        # k_labels = torch.reshape(k_labels, (query_batch_length, key_per_query))
-        key_cls_output = torch.reshape(key_cls_output, (query_batch_length, key_per_query, key_cls_output.shape[1])) # shape: (num_batch, num_tem_aug_data, bert_hidden_size)
-        
-        # modify key_cls_output for labeling
-        batch_label = []
-        for i in range(query_batch_length):
-        # for i, each_key_cls, k_label in enumerate(zip(key_cls_output, k_labels)):
-            label = torch.randperm(key_per_query)
-            key_cls_output[i] = key_cls_output[i][label]
-            batch_label.append((label == 0).nonzero().item())
-
-        query_cls_output.unsqueeze_(1)
-        key_cls_output = torch.transpose(key_cls_output, 1, 2) # shape: (num_batch, bert_hidden_size, num_adapting_data)
-
-        query_key_mult = torch.bmm(query_cls_output, key_cls_output).squeeze(1)
-        batch_label = torch.tensor(batch_label).cuda()
-        
-        cl_loss = self.ce_loss(query_key_mult, batch_label)
 
         # BIO Triplet tag(CRF) loss
         query_sequence_output = self.dropout(query_sequence_output)
         logits = self.classifier(query_sequence_output)
         ## select only utterance: except padded seq & front seq([CLS]slot_label[SEP])
-        crf_losses = None
+        # crf_losses = None
+        loss = 0 # crf loss
         for logit, utter_range, q_label in zip(logits, utter_ranges, q_labels):
             front, rear = utter_range
             use_logit = logit[front:rear, :]
             use_q_label = q_label[front:rear]
             crf_loss = self.crf(use_logit.unsqueeze(0), use_q_label.unsqueeze(0))
-            try: 
-                crf_losses = torch.vstack(crf_losses, crf_loss)
-            except:
-                crf_losses = crf_loss
+            loss += crf_loss
+            # try: 
+            #     crf_losses = torch.hstack((crf_losses, crf_loss))
+            # except:
+            #     crf_losses = crf_loss
 
-        self.key_updated_cnt += 1
-        loss = crf_loss * (1-self.key_ratio) + cl_loss * self.key_ratio
+        loss /= len(logits)
+
+        if key_input is not None: # training
+            k_input_reshape = {}
+            key_batch_length, key_per_query, _ = key_input['input_ids'].shape
+
+            for k, v in key_input.items():
+                if len(v.shape) == 3:
+                    k_input_reshape[k] = v.reshape(key_batch_length * key_per_query, -1)
+
+            k_input_ids = k_input_reshape["input_ids"]
+            k_attention_mask = k_input_reshape["attention_mask"]
+            k_token_type_ids = k_input_reshape["token_type_ids"]
+
+            key_outputs = self.key_bert(
+                k_input_ids,
+                attention_mask=k_attention_mask,
+                token_type_ids=k_token_type_ids,
+                position_ids=position_ids,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+
+            key_cls_output = key_outputs.last_hidden_state[:, 0, :]
+
+            # For Contrastive Loss
+            # key input: [pos_tem/pos_aug, neg_tem1, neg_tem2, ..., neg_aug1, neg_aug2, ...]
+            key_cls_output = torch.reshape(key_cls_output, (key_batch_length, key_per_query, -1)) # shape: (num_batch, num_tem_aug_data, bert_hidden_size)
+        
+            # modify key_cls_output for labeling
+            batch_label = []
+            for i in range(query_batch_length):
+            # for i, each_key_cls, k_label in enumerate(zip(key_cls_output, k_labels)):
+                label = torch.randperm(key_per_query)
+                key_cls_output[i] = key_cls_output[i][label]
+                batch_label.append((label == 0).nonzero().item())
+
+            query_cls_output.unsqueeze_(1)
+            key_cls_output = torch.transpose(key_cls_output, 1, 2) # shape: (num_batch, bert_hidden_size, num_adapting_data)
+
+            query_key_mult = torch.bmm(query_cls_output, key_cls_output).squeeze(1)
+            batch_label = torch.tensor(batch_label).cuda()
+            
+            cl_loss = self.ce_loss(query_key_mult, batch_label)
+            self.key_updated_cnt += 1
+        
+            loss = loss * (1-self.key_ratio) + cl_loss * self.key_ratio
+        
         return loss, logits
 
     def update_key_enc(self):
         if self.key_updated_cnt % self.key_update_period == 0:
             for q_params, k_params in zip(self.query_bert.parameters(), self.key_bert.parameters()):
-                k_params = self.m * k_params + (1 - self.m) * q_params
+                k_params = self.momentum * k_params + (1 - self.momentum) * q_params
 
         return
