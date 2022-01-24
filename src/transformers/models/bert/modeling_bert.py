@@ -1940,6 +1940,7 @@ class BertForSLU(BertPreTrainedModel):
         q_token_type_ids,
         q_attention_mask,
         q_labels,
+        q_label_masks,
         utter_ranges,
         key_input,
         position_ids=None,
@@ -1984,23 +1985,58 @@ class BertForSLU(BertPreTrainedModel):
         query_cls_output = query_outputs.last_hidden_state[:, 0, :] # shape: (num_batch, bert_hidden_size)
 
         # BIO Triplet tag(CRF) loss
-        query_sequence_output = self.dropout(query_sequence_output)
-        logits = self.classifier(query_sequence_output)
+        # first, select only after first [SEP] (utterance sequence only)
+        _query_sequence_output = None
+        _q_labels = None
+        _q_label_masks = None
+        max_len = 0
+        for query_output, utter_range in zip(query_sequence_output, utter_ranges):
+            front, _ = utter_range
+            seq_len = query_output[front:].shape[0]
+            # _query_sequence_output.append(query_output[front:])
+            # _q_labels.append(query_label[front:])
+            # _q_label_masks.append(query_label_mask[front:])
+            if max_len < seq_len:
+                max_len = seq_len
+
+        # padding for reproduced tensors
+        for query_output, query_label, query_label_mask, utter_range in zip(query_sequence_output, q_labels, q_label_masks, utter_ranges):
+            front, _ = utter_range
+            seq_len, hidden_size = query_output[front:].shape
+            pad_tensor_for_enc = torch.zeros((max_len-seq_len, hidden_size)).cuda()
+            pad_tensor_for_label = torch.zeros((max_len-seq_len), dtype=torch.long).cuda()
+            padded_query_output = torch.cat([query_output[front:], pad_tensor_for_enc], dim=0).unsqueeze(0)
+            padded_query_label = torch.cat([query_label[front:], pad_tensor_for_label], dim=0).unsqueeze(0)
+            padded_query_label_mask = torch.cat([query_label_mask[front:], pad_tensor_for_label], dim=0).unsqueeze(0)
+
+            if _query_sequence_output is None:
+                _query_sequence_output = padded_query_output
+                _q_labels = padded_query_label
+                _q_label_masks = padded_query_label_mask
+            else:
+                _query_sequence_output = torch.vstack((_query_sequence_output, padded_query_output))
+                _q_labels = torch.vstack((_q_labels, padded_query_label))
+                _q_label_masks = torch.vstack((_q_label_masks, padded_query_label_mask))
+
+        _q_label_masks = _q_label_masks.bool()
+        _query_sequence_output = self.dropout(_query_sequence_output)
+        logits = self.classifier(_query_sequence_output)
         ## select only utterance: except padded seq & front seq([CLS]slot_label[SEP])
         # crf_losses = None
         loss = 0 # crf loss
-        for logit, utter_range, q_label in zip(logits, utter_ranges, q_labels):
-            front, rear = utter_range
-            use_logit = logit[front:rear, :]
-            use_q_label = q_label[front:rear]
-            crf_loss = self.crf(use_logit.unsqueeze(0), use_q_label.unsqueeze(0))
-            loss += crf_loss
+        crf_loss = self.crf(logits, _q_labels, mask=_q_label_masks, reduction="mean")
+        # for logit, utter_range, q_label in zip(logits, utter_ranges, q_labels):
+        #     front, rear = utter_range
+        #     use_logit = logit[front:rear, :]
+        #     use_q_label = q_label[front:rear]
+        #     crf_loss = self.crf(use_logit.unsqueeze(0), use_q_label.unsqueeze(0), mask=q_label_masks)
+        #     loss += crf_loss
             # try: 
             #     crf_losses = torch.hstack((crf_losses, crf_loss))
             # except:
             #     crf_losses = crf_loss
 
-        loss /= len(logits)
+        loss = crf_loss * (-1)
 
         if key_input is not None: # training
             k_input_reshape = {}

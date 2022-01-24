@@ -465,6 +465,7 @@ class DataCollatorForSLU(DataCollatorMixin):
 
             label_name = "label" if "label" in _features[0].keys() else "labels"
             labels = [feature[label_name] for feature in _features] if label_name in _features[0].keys() else None
+            label_masks = [feature['label_mask'] for feature in _features] if label_name in _features[0].keys() else None
             _batch = self.tokenizer.pad(
                 _features,
                 padding=self.padding,
@@ -477,12 +478,18 @@ class DataCollatorForSLU(DataCollatorMixin):
             sequence_length = torch.tensor(_batch["input_ids"]).shape[1]
             padding_side = self.tokenizer.padding_side
             if key == "utter": # for utterance
+                # _batch[label_name] = [
+                #     [self.label_pad_token_id] * front + 
+                #     list(label) + 
+                #     [self.label_pad_token_id] * (sequence_length - rear) 
+                #     for label, (front, rear) in zip(labels, utter_range)
+                # ] 
                 _batch[label_name] = [
-                    [self.label_pad_token_id] * front + 
-                    list(label) + 
-                    [self.label_pad_token_id] * (sequence_length - rear) 
-                    for label, (front, rear) in zip(labels, utter_range)
-                ] 
+                    list(label) + [self.label_pad_token_id] * (sequence_length - len(label)) for label in labels
+                ]
+                _batch['label_mask'] = [
+                    list(label_mask) + [0] * (sequence_length - len(label_mask)) for label_mask in label_masks
+                ]
                 _batch = {k: torch.tensor(v, dtype=torch.int64) for k, v in _batch.items()}
 
                 for k, v in _batch.items():
